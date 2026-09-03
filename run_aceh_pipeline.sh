@@ -14,7 +14,7 @@ TE="94.9 1.8 98.3 6.1"
 # 1 arc-second (~30m) in degrees — native GLO-30 resolution
 RES=0.0002777778
 
-echo ">>> Step 1/9: fetch Copernicus GLO-30 DEM tiles (AWS Open Data, no auth)"
+echo ">>> Step 1/10: fetch Copernicus GLO-30 DEM tiles (AWS Open Data, no auth)"
 for lat in 01 02 03 04 05 06; do
   for lon in 094 095 096 097 098; do
     t="Copernicus_DSM_COG_10_N${lat}_00_E${lon}_00_DEM"
@@ -25,7 +25,7 @@ for lat in 01 02 03 04 05 06; do
   done
 done
 
-echo ">>> Step 2/9: fetch matching Water Body Mask tiles (same bucket, AUXFILES/)"
+echo ">>> Step 2/10: fetch matching Water Body Mask tiles (same bucket, AUXFILES/)"
 for f in glo30/*.tif; do
   base=$(basename "$f" _DEM.tif)
   wbm_file="${base}_WBM.tif"
@@ -35,7 +35,7 @@ for f in glo30/*.tif; do
     "wbm/${wbm_file}"
 done
 
-echo ">>> Step 3/9: fetch ETH Global Canopy Height 2020 tiles (libdrive.ethz.ch, 3deg grid)"
+echo ">>> Step 3/10: fetch ETH Global Canopy Height 2020 tiles (libdrive.ethz.ch, 3deg grid)"
 for lat in N00 N03 N06; do
   for lon in E093 E096; do
     f="ETH_GlobalCanopyHeight_10m_2020_${lat}${lon}_Map.tif"
@@ -45,16 +45,16 @@ for lat in N00 N03 N06; do
   done
 done
 
-echo ">>> Step 4/9: mosaic each dataset into virtual rasters (no disk copies)"
+echo ">>> Step 4/10: mosaic each dataset into virtual rasters (no disk copies)"
 gdalbuildvrt -overwrite dem.vrt glo30/*.tif
 gdalbuildvrt -overwrite wbm.vrt wbm/*.tif
 gdalbuildvrt -overwrite canopy.vrt eth/*.tif
 
-echo ">>> Step 5/9: clip DEM to the Aceh AOI on the native 30m grid"
+echo ">>> Step 5/10: clip DEM to the Aceh AOI on the native 30m grid"
 gdalwarp -t_srs EPSG:4326 -te $TE -tr $RES $RES -tap \
   dem.vrt dem_aoi.tif -overwrite
 
-echo ">>> Step 6/9: align canopy height onto the same grid (10m->30m, mean height)"
+echo ">>> Step 6/10: align canopy height onto the same grid (10m->30m, mean height)"
 # Source nodata is 255 (real canopy values run 0-64). We exclude 255 from the
 # average via -srcnodata, but deliberately do NOT set -dstnodata to anything -
 # tagging the *output* as nodata=255 previously caused gdal_calc.py to silently
@@ -71,20 +71,52 @@ gdal_calc.py -A canopy_aligned_raw.tif \
   --calc="numpy.where((numpy.isnan(A)) | (A>250), 0, A)" \
   --outfile=canopy_aligned.tif --type=Float32 --NoDataValue=none --overwrite
 
-echo ">>> Step 7/9: bare-earth = DSM - canopy (clamped so canopy can't exceed DSM)"
+echo ">>> Step 7/10: bare-earth = DSM - canopy (clamped so canopy can't exceed DSM)"
 gdal_calc.py -A dem_aoi.tif -B canopy_aligned.tif \
   --calc="A-numpy.minimum(B,A)" --outfile=bare.tif --type=Float32 \
   --co COMPRESS=DEFLATE --overwrite
 
-echo ">>> Step 8/9: slope (Horn's method, degrees) + terrain-only threshold"
+echo ">>> Step 8/10: light 3x3 mean smoothing on bare-earth before slope"
+# PDF sec.5 "smooth lightly": canopy model carries its own error, so the
+# subtracted surface has spurious micro-relief. A 3x3 box-mean suppresses it
+# without flattening real terrain. No GDAL CLI utility does neighborhood
+# ops directly (gdal_calc.py is pixel-wise only), so this is a small inline
+# numpy pass - reads the full array into memory, fine at province scale
+# (~750MB here); would need windowed/chunked processing at global-belt scale.
+python3 <<'PYEOF'
+from osgeo import gdal
+import numpy as np
+
+ds = gdal.Open("bare.tif")
+arr = ds.GetRasterBand(1).ReadAsArray().astype(np.float32)
+
+padded = np.pad(arr, 1, mode="edge")
+smooth = np.zeros_like(arr)
+for dy in range(3):
+    for dx in range(3):
+        smooth += padded[dy:dy + arr.shape[0], dx:dx + arr.shape[1]]
+smooth /= 9.0
+
+driver = gdal.GetDriverByName("GTiff")
+out = driver.Create("bare_smooth.tif", ds.RasterXSize, ds.RasterYSize, 1,
+                     gdal.GDT_Float32, options=["COMPRESS=DEFLATE"])
+out.SetGeoTransform(ds.GetGeoTransform())
+out.SetProjection(ds.GetProjection())
+out.GetRasterBand(1).WriteArray(smooth)
+out.FlushCache()
+PYEOF
+
+echo ">>> Step 9/10: slope (Horn's method, degrees) + terrain-only threshold"
 # -s 111120 assumes equatorial pixel spacing; fine at Aceh's 1.8-6.1N latitude
 # (<0.5% bias), but would need a cos(lat) correction near 30N/S.
-gdaldem slope bare.tif slope_deg.tif -alg Horn -s 111120 -compute_edges
+# Both slope and the elevation check use the smoothed surface (matches B's
+# GEE implementation, which thresholds bareEarthSmooth for both).
+gdaldem slope bare_smooth.tif slope_deg.tif -alg Horn -s 111120 -compute_edges
 
-gdal_calc.py -A slope_deg.tif -B bare.tif \
+gdal_calc.py -A slope_deg.tif -B bare_smooth.tif \
   --calc="(A<=25)*(B<=1000)" --outfile=terrain_suitable.tif --type=Byte --overwrite
 
-echo ">>> Step 9/9: exclude water, then finalize"
+echo ">>> Step 10/10: exclude water, then finalize"
 gdalwarp -t_srs EPSG:4326 -te $TE -tr $RES $RES -tap -r near \
   wbm.vrt wbm_aoi.tif -overwrite
 
