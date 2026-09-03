@@ -1,4 +1,3 @@
-# suitability-palmoil
 # RI-2-9 Palm Oil Suitability — Aceh Test Pipeline
 
 Prototype run of the binary (suitable/unsuitable) palm oil suitability mask described in
@@ -48,11 +47,20 @@ loop skips (404 = expected, not an error).
    explicit zero-fill + `--NoDataValue=none` sequence exists specifically to avoid it.
 7. **Bare-earth = DSM − canopy**, clamped so canopy height can never exceed the DSM value
    (protects against noisy canopy pixels driving elevation below plausible ground).
-8. **Slope** via Horn's method (GDAL/ArcGIS default, degrees), then the terrain threshold
-   `(slope≤25)*(elevation≤1000)`.
-9. **Water exclusion**: align WBM to the same grid (nearest-neighbor — it's categorical, not
-   continuous), build a land mask (`WBM==0`), and AND it into the terrain mask. Cloud-optimize
-   the result.
+8. **Smooth bare-earth with a 3×3 mean filter** before computing slope (PDF §5, "smooth
+   lightly"). No GDAL CLI utility does neighborhood ops directly, so this is a small inline
+   `numpy` pass (edge-replicated padding, box mean). Reads the full array into memory — fine
+   at province scale (~750MB here), would need windowed/chunked processing at global-belt
+   scale. This also noticeably reduces (though doesn't fully eliminate) spurious noise in
+   dense urban areas, where the DSM's building-rooftop relief creates chaotic local slope
+   values unrelated to real terrain — see the [Known caveats](#known-caveats-carried-over-from-the-pdf-9)
+   section.
+9. **Slope** via Horn's method (GDAL/ArcGIS default, degrees) on the *smoothed* surface, then
+   the terrain threshold `(slope≤25)*(elevation≤1000)` — both slope and the elevation check
+   use the smoothed surface, matching the reference GEE implementation.
+10. **Water exclusion**: align WBM to the same grid (nearest-neighbor — it's categorical, not
+    continuous), build a land mask (`WBM==0`), and AND it into the terrain mask.
+    Cloud-optimize the result.
 
 Output: `aceh_test/suitable_cog.tif` — single-band Byte COG, `0`=unsuitable/water,
 `1`=suitable, same grid as `dem_aoi.tif`.
