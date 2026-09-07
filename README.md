@@ -1,26 +1,78 @@
 # RI-2-9 Palm Oil Suitability — Aceh Test Pipeline
 
-Prototype run of the binary (suitable/unsuitable) palm oil suitability mask described in
-`palm_oil_suitability_RI-2-9 Version 2 2026-07-20.pdf`, scoped to Aceh province, Indonesia,
-as a small-region validation before scaling to the full pan-tropical belt.
+End-to-end pipeline: raw tiles → binary suitability raster → **polygonize** → H3 resolution-11 Parquet. 
 
-**Rule:** a pixel is `suitable` if `(slope ≤ 25°) AND (elevation ≤ 1,000m) AND (not water)`.
+Testing : Scoped to Aceh province, Indonesia.
+
+**Rule:** a location is `suitable` if `(slope ≤ 25°) AND (elevation ≤ 1,000m) AND (not water)`.
 Terrain-only — no climate, soil, land-cover, or economic filters beyond excluding open water.
 
-## Run it
+## What you need before starting
+
+- GDAL CLI (`gdalwarp`, `gdal_calc.py`, `gdaldem`, `gdalbuildvrt`, `gdal_translate`) — verified
+  working with Homebrew GDAL 3.13.3.
+- AWS CLI, `curl`.
+- `python3.10` specifically for the H3 step (see [Part 2](#part-2-convert-to-h3-resolution-11)
+  for why — this machine's default `python3` is 3.14, and several geospatial packages don't
+  have prebuilt wheels for it yet).
+
+---
+
+## Part 1: Build the suitability raster
 
 ```bash
+cd ~/Downloads/"Suitability Maps"
 bash run_aceh_pipeline.sh
 ```
 
-Requires: GDAL CLI (`gdalwarp`, `gdal_calc.py`, `gdaldem`, `gdalbuildvrt`, `gdal_translate`),
-AWS CLI, `curl`. All verified working with Homebrew GDAL 3.13.3. Run with `bash`, not pasted
-into `zsh` directly — zsh doesn't word-split unquoted multi-value variables the way bash does,
-which breaks `gdalwarp -te $TE`.
+One command, ~10-15 min and ~2GB of downloads on a first run (re-runs skip files already on
+disk). Does everything: fetches Copernicus GLO-30 DEM + Water Body Mask tiles and ETH Global
+Canopy Height tiles for the Aceh bounding box, mosaics them, subtracts canopy height from the
+DEM to get bare-earth, smooths it (3×3 mean, suppresses canopy-model noise), computes slope,
+thresholds, excludes water, and cloud-optimizes the result.
 
-Takes ~10-15 min and ~2GB of downloads on first run (re-runs skip files already on disk).
+**Output Cases: `aceh_test/suitable_cog.tif`** — single-band Byte COG, `0`=unsuitable/water,
+`1`=suitable, ~29.9% of the AOI.
 
-## Data sources
+---
+
+## Part 2: Convert to H3 resolution 11
+
+```bash
+cd ~/Downloads/"Suitability Maps"/h3-export
+python3.10 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python polygon_to_h3.py ../aceh_test/suitable_cog.tif -r 11
+```
+
+Use `python3.10`, not a bare `python3` — confirmed working (same version `radd-main`'s own
+venv uses); the system default 3.14 risks slow/failing from-source builds for
+rasterio/pyarrow/shapely/pyproj.
+
+**Tooks 4hr for Aceh only**
+
+`polygon_to_h3.py` vectorizes the raster's suitable area into polygons (~5s) then fills
+each with H3 cells (`h3.polygon_to_cells`) — fine for most polygons, but H3's fill algorithm
+tests every candidate hexagon individually against the polygon boundary with no shortcut for
+solid interior area, so a handful of very large/complex polygons (confirmed via live process
+sampling) each took over an hour by themselves. 
+
+Use `suitability_to_h3.py` if want to use per-pixel approach, benchmarked at ~1,000 rows/sec,
+which extrapolates to 12+ hours on Aceh alone. 
+
+**Output: `h3-export/output/suitable_cog_h3.parquet`** — columns `h3` (resolution-11 cell
+index, string), `hex_area_m2` (double).
+
+
+---
+
+## Pipeline details (Part 1)
+
+<details>
+<summary>Data sources, pipeline stages, the NoData pitfall, and full caveats</summary>
+
+### Data sources
 
 | Dataset | Role | Source | Resolution |
 |---|---|---|---|
@@ -28,80 +80,50 @@ Takes ~10-15 min and ~2GB of downloads on first run (re-runs skip files already 
 | Copernicus WBM | Water body mask (0=land, 1=ocean, 2=lake, 3=river) | Same bucket, `<tile>/AUXFILES/<tile>_WBM.tif` | 30m, same grid as DEM |
 | ETH Global Canopy Height 2020 | Canopy height, subtracted from DSM for bare-earth | `libdrive.ethz.ch` (Lang et al. 2023, CC BY 4.0) | 10m |
 
-GLO-30 and WBM tiles are 1°×1°, named by SW-corner lat/lon
+GLO-30/WBM tiles are 1°×1°, named by SW-corner lat/lon
 (`Copernicus_DSM_COG_10_N05_00_E095_00_DEM.tif`). ETH canopy tiles are 3°×3°
-(`ETH_GlobalCanopyHeight_10m_2020_N03E096_Map.tif`). Neither dataset covers a rectangle
-cleanly — some GLO-30/WBM tiles legitimately don't exist over open ocean, which the fetch
-loop skips (404 = expected, not an error).
+(`ETH_GlobalCanopyHeight_10m_2020_N03E096_Map.tif`). Some GLO-30/WBM tiles legitimately don't
+exist over open ocean — the fetch loop skips these (404 = expected, not an error).
 
-## Pipeline stages
+### Pipeline stages
 
-1. **Fetch GLO-30 DEM tiles** intersecting the Aceh bounding box (`94.9, 1.8, 98.3, 6.1`).
-2. **Fetch matching WBM tiles** — same tile names, `AUXFILES/` subfolder.
-3. **Fetch ETH canopy tiles** covering the same area.
-4. **Mosaic** each dataset into a VRT (virtual, no disk copies).
-5. **Clip the DEM** to the AOI on its native 30m grid — this defines the reference grid every
-   later step aligns to.
-6. **Align canopy height onto that grid** (10m → 30m, mean-resampled). This step has a subtle
-   trap (see [NoData pitfall](#nodata-pitfall) below) — the script's `-srcnodata 255` +
-   explicit zero-fill + `--NoDataValue=none` sequence exists specifically to avoid it.
-7. **Bare-earth = DSM − canopy**, clamped so canopy height can never exceed the DSM value
-   (protects against noisy canopy pixels driving elevation below plausible ground).
-8. **Smooth bare-earth with a 3×3 mean filter** before computing slope (PDF §5, "smooth
-   lightly"). No GDAL CLI utility does neighborhood ops directly, so this is a small inline
-   `numpy` pass (edge-replicated padding, box mean). Reads the full array into memory — fine
-   at province scale (~750MB here), would need windowed/chunked processing at global-belt
-   scale. This also noticeably reduces (though doesn't fully eliminate) spurious noise in
-   dense urban areas, where the DSM's building-rooftop relief creates chaotic local slope
-   values unrelated to real terrain — see the [Known caveats](#known-caveats-carried-over-from-the-pdf-9)
-   section.
-9. **Slope** via Horn's method (GDAL/ArcGIS default, degrees) on the *smoothed* surface, then
-   the terrain threshold `(slope≤25)*(elevation≤1000)` — both slope and the elevation check
-   use the smoothed surface, matching the reference GEE implementation.
-10. **Water exclusion**: align WBM to the same grid (nearest-neighbor — it's categorical, not
-    continuous), build a land mask (`WBM==0`), and AND it into the terrain mask.
-    Cloud-optimize the result.
+1. Fetch GLO-30 DEM tiles intersecting the Aceh bbox (`94.9, 1.8, 98.3, 6.1`).
+2. Fetch matching WBM tiles (same tile names, `AUXFILES/` subfolder).
+3. Fetch ETH canopy tiles covering the same area.
+4. Mosaic each dataset into a VRT.
+5. Clip the DEM to the AOI on its native 30m grid — the reference grid everything else aligns to.
+6. Align canopy height onto that grid (10m→30m, mean-resampled) — see NoData pitfall below.
+7. Bare-earth = DSM − canopy, clamped so canopy height can never exceed the DSM value.
+8. Smooth bare-earth with a 3×3 mean filter before slope (PDF §5, "smooth lightly") — a small
+   inline `numpy` pass, since no GDAL CLI utility does neighborhood ops directly. Also reduces
+   (doesn't fully eliminate) noise in dense urban areas from DSM building-rooftop relief.
+9. Slope via Horn's method on the smoothed surface, then the terrain threshold.
+10. Water exclusion: align WBM to the same grid (nearest-neighbor), build a land mask
+    (`WBM==0`), AND it into the terrain mask, cloud-optimize.
 
-Output: `aceh_test/suitable_cog.tif` — single-band Byte COG, `0`=unsuitable/water,
-`1`=suitable, same grid as `dem_aoi.tif`.
+### NoData pitfall
 
-## NoData pitfall
+ETH canopy tiles use `255` as their NoData sentinel (real canopy values run 0-64m). Tagging
+the *output* of the canopy resample as NoData=255 (or worse, NoData=0, which collides with
+genuine "no canopy" ground pixels) causes `gdal_calc.py` to mask its output to NoData wherever
+*any* input band's pixel equals *that band's declared* NoData value — a post-processing step
+that overrides whatever `--calc` actually computed. This silently dropped ~64% of the entire
+AOI in an early version, invisible in histograms unless you compare classified pixel count
+against the raster's total pixel count. Fix (already in the script): warp with `-srcnodata 255`
+so invalid source pixels are still excluded from the average, but never tag the *output* as
+NoData — zero-fill leftovers and strip the NoData flag explicitly before it reaches
+`gdal_calc.py`.
 
-Worth understanding before touching this pipeline again. ETH canopy tiles use `255` as their
-NoData sentinel (real canopy values run 0–64m). Naively resampling with `-dstnodata 255` (or
-worse, `-dstnodata 0`, which collides with genuine "no canopy" ground pixels) tags the *output*
-raster's metadata as NoData=255. `gdal_calc.py` then masks its output to NoData wherever *any*
-input band's pixel equals *that band's declared* NoData value — as a post-processing step that
-overrides whatever the `--calc` expression actually computed. In the first Aceh run this
-silently dropped **~64% of the entire AOI** (anywhere ETH's canopy model had low confidence —
-common over urban areas, bare soil, and open water) as NoData, invisible in histograms unless
-you compare the classified pixel count against the raster's total pixel count.
+### Caveats (carried over from the PDF, §9, plus what we found empirically)
 
-Fix: warp with `-srcnodata 255` (so invalid source pixels are still correctly excluded from
-the average) but never tag the output itself as NoData. Explicitly zero-fill leftovers and
-strip the NoData flag before the file reaches `gdal_calc.py`.
+- RSPO's 25° threshold is a 25ha block-average; per-pixel 30m thresholding is stricter than
+  the regulatory intent. A focal-mean smoothing pass would better match it (the 3×3 filter in
+  step 8 is a start, not a full fix for this specific point).
+- Bare-earth correction is modelled, not measured — validate against reference lidar before
+  trusting steep-edge pixels.
+- Water exclusion only removes water — cities/roads/agriculture still register as suitable.
+- Equatorial slope scale (`-s 111120`) is accurate to <0.5% at Aceh's latitude, would need a
+  cos(latitude) correction closer to the belt's 30°N/S edges.
+- AOI is a rectangular bounding box, not Aceh's real administrative polygon.
 
-## Known caveats (carried over from the PDF, §9)
-
-- **RSPO's 25° threshold is a 25ha block-average**; per-pixel 30m thresholding is stricter
-  (less generous) than the regulatory intent. A focal-mean smoothing pass before thresholding
-  would better match it — not yet implemented here.
-- **Bare-earth correction is modelled, not measured** — residual canopy-model error propagates
-  into slope. Validate against reference lidar before trusting steep-edge pixels.
-- **Water exclusion only removes water** — it does not exclude cities/roads/agriculture, which
-  will still register as trivially "suitable" (flat, low elevation) since the base DSM includes
-  building rooftops and the ETH canopy correction only removes tree height, not structures. A
-  land-cover mask would be the next layer to add for a real risk product, per the PDF's own
-  framing ("meant to be combined with land-cover... layers").
-- **Equatorial slope scale** (`-s 111120` in `gdaldem slope`) is accurate to <0.5% at Aceh's
-  latitude (1.8–6.1°N) but would need a cos(latitude) correction closer to the belt's 30°N/S
-  edges.
-- **AOI is a rectangular bounding box**, not Aceh's actual administrative polygon — the output
-  extends slightly beyond the real province boundary (harmless now that water is masked, since
-  excess ocean reads as unsuitable rather than falsely suitable).
-
-## Viewing the result
-
-Open `aceh_test/suitable_cog.tif` in QGIS, style as Singleband Pseudocolor / Paletted with
-0→red, 1→green. The Bukit Barisan mountain range running down Aceh's spine should render red
-(unsuitable); flat coastal/valley terrain should render green.
+</details>
