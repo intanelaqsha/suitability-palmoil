@@ -1,8 +1,8 @@
 # RI-2-9 Palm Oil Suitability — Aceh Test Pipeline
 
-End-to-end pipeline: raw tiles → binary suitability raster → **polygonize** → H3 resolution-11 Parquet. 
-
-Testing : Scoped to Aceh province, Indonesia.
+End-to-end pipeline: raw DEM/canopy tiles → binary suitability raster → H3 resolution-11
+Parquet. Scoped to Aceh province, Indonesia, as a small-region validation before scaling to
+the full pan-tropical belt (per `palm_oil_suitability_RI-2-9 Version 2 2026-07-20.pdf`).
 
 **Rule:** a location is `suitable` if `(slope ≤ 25°) AND (elevation ≤ 1,000m) AND (not water)`.
 Terrain-only — no climate, soil, land-cover, or economic filters beyond excluding open water.
@@ -31,8 +31,10 @@ Canopy Height tiles for the Aceh bounding box, mosaics them, subtracts canopy he
 DEM to get bare-earth, smooths it (3×3 mean, suppresses canopy-model noise), computes slope,
 thresholds, excludes water, and cloud-optimizes the result.
 
-**Output Cases: `aceh_test/suitable_cog.tif`** — single-band Byte COG, `0`=unsuitable/water,
-`1`=suitable, ~29.9% of the AOI.
+**Output: `aceh_test/suitable_cog.tif`** — single-band Byte COG, `0`=unsuitable/water,
+`1`=suitable, ~29.9% of the AOI. See that folder's pipeline stages, the NoData pitfall, and
+known caveats in the [Pipeline details](#pipeline-details-part-1) section below — worth
+reading before touching the script, not just running it blind.
 
 ---
 
@@ -50,22 +52,125 @@ Use `python3.10`, not a bare `python3` — confirmed working (same version `radd
 venv uses); the system default 3.14 risks slow/failing from-source builds for
 rasterio/pyarrow/shapely/pyproj.
 
-**Tooks 4hr for Aceh only**
-
-`polygon_to_h3.py` vectorizes the raster's suitable area into polygons (~5s) then fills
+**This step is slow — confirmed ~4h23m for Aceh alone**, not a bug to fix before running it.
+`polygon_to_h3.py` vectorizes the raster's suitable area into polygons (fast, ~5s) then fills
 each with H3 cells (`h3.polygon_to_cells`) — fine for most polygons, but H3's fill algorithm
 tests every candidate hexagon individually against the polygon boundary with no shortcut for
 solid interior area, so a handful of very large/complex polygons (confirmed via live process
-sampling) each took over an hour by themselves. 
-
-Use `suitability_to_h3.py` if want to use per-pixel approach, benchmarked at ~1,000 rows/sec,
-which extrapolates to 12+ hours on Aceh alone. 
+sampling) each took over an hour by themselves. Do not use `suitability_to_h3.py` (the other
+script in this folder) — it's the original per-pixel approach, benchmarked at ~1,000 rows/sec,
+which extrapolates to 12+ hours on Aceh alone. Kept only for reference. See
+[Known issues & next steps](#known-issues--next-steps) for what actually fixes this (not yet
+built).
 
 **Output: `h3-export/output/suitable_cog_h3.parquet`** — columns `h3` (resolution-11 cell
-index, string), `hex_area_m2` (double).
-
+index, string), `hex_area_m2` (double). 21,133,020 rows for Aceh; only suitable cells are
+present — unsuitable area isn't stored as rows at all.
 
 ---
+
+## Validate the result
+
+Six checks, run from `h3-export` with the venv active:
+
+```bash
+cd ~/Downloads/"Suitability Maps"/h3-export
+source .venv/bin/activate
+```
+
+**1. File opens cleanly, basic shape:**
+```bash
+python3 -c "
+import pyarrow.parquet as pq
+t = pq.read_table('output/suitable_cog_h3.parquet')
+print('rows:', t.num_rows)
+print('schema:', t.schema)
+print(t.slice(0,5).to_pandas())
+"
+```
+
+**2. Cross-check with a different reader (DuckDB, not PyArrow) + duplicate check:**
+```bash
+python3 -c "
+import duckdb
+con = duckdb.connect()
+print(con.execute(\"SELECT COUNT(*), COUNT(DISTINCT h3) FROM read_parquet('output/suitable_cog_h3.parquet')\").fetchall())
+"
+```
+Both counts should match (no duplicates — built from a Python `set`).
+
+**3. Every H3 index is valid and actually resolution 11:**
+```bash
+python3 -c "
+import pyarrow.parquet as pq
+import h3
+t = pq.read_table('output/suitable_cog_h3.parquet')
+ids = t['h3'].to_pylist()
+bad = [h for h in ids if not h3.is_valid_cell(h) or h3.get_resolution(h) != 11]
+print('total:', len(ids), '  invalid/wrong-resolution:', len(bad))
+"
+```
+
+**4. Area values are sane (expect ~2,150-2,600 m², no zeros/negatives/outliers):**
+```bash
+python3 -c "
+import pyarrow.parquet as pq
+import pyarrow.compute as pc
+t = pq.read_table('output/suitable_cog_h3.parquet')
+print('min:', pc.min(t['hex_area_m2']).as_py())
+print('max:', pc.max(t['hex_area_m2']).as_py())
+print('mean:', pc.mean(t['hex_area_m2']).as_py())
+"
+```
+
+**5. Total area roughly matches the source raster** (expect a few % difference from
+hex-vs-pixel boundary approximation — not a red flag):
+```bash
+python3 -c "
+import pyarrow.parquet as pq
+import pyarrow.compute as pc
+t = pq.read_table('output/suitable_cog_h3.parquet')
+print(f'{pc.sum(t[\"hex_area_m2\"]).as_py()/1e6:,.1f} km^2 total (H3)')
+print(f'{56_619_610 * 900 / 1e6:,.1f} km^2 total (raster pixel count)')
+"
+```
+
+**6. Spot-check a known point** (flat Banda Aceh delta, validated earlier in the raster
+pipeline: slope=2.0°, elevation=6.1m, raster value=1 — should print `True`):
+```bash
+python3 -c "
+import h3, pyarrow.parquet as pq
+t = pq.read_table('output/suitable_cog_h3.parquet')
+h3_set = set(t['h3'].to_pylist())
+cell = h3.latlng_to_cell(5.545437, 95.310726, 11)
+print('known-suitable point present:', cell in h3_set)
+"
+```
+
+**Visual check:** kepler.gl (native H3 hexagon rendering, handles all 21M rows) — drag in
+`suitable_cog_h3.parquet`, add an H3 layer on the `h3` column. Or for a local/QGIS check on a
+smaller sample, convert cells to boundary polygons and export GeoJSON (see
+`h3-export/README.md` for the script).
+
+---
+
+## Known issues & next steps
+
+- **Global-belt scale is not solved yet.** 4h23m for one small province, with two separate
+  multi-hour stalls on individual complex polygons, is proof of correctness, not proof of a
+  viable path to the full tropical belt (vastly larger). The real fix is adaptive/hierarchical
+  refinement: test coarse H3 cells (e.g. resolution 6) against the suitable-area polygons —
+  fully outside → discard, fully inside → generate all resolution-11 descendants via cheap
+  index arithmetic (`h3.cell_to_children` / `h3.uncompact_cells`, no geometry, no per-cell
+  test), only recurse into children for cells that straddle a boundary. This only pays the
+  expensive point-in-polygon cost near actual edges (mountain ridgelines, coastlines) instead
+  of for every cell in the solid interior of a large blob. Still uniform resolution 11 output —
+  matches spec, just gets there without enumerating every interior cell one at a time. **Not
+  yet built.**
+- Urban/built-up areas (e.g. Banda Aceh's city core) still register as suitable, since the
+  base DSM includes building rooftops and the canopy correction only removes tree height. A
+  land-cover mask would be the next layer to add for a real risk product.
+- AOI is a rectangular bounding box, not Aceh's actual administrative polygon.
 
 ## Pipeline details (Part 1)
 

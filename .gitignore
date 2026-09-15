@@ -1,0 +1,15 @@
+# Raster pipeline data - regenerable via run_aceh_pipeline.sh
+aceh_test/
+
+# H3 export - venv and generated output, regenerable via h3-export/README.md
+h3-export/.venv/
+h3-export/output/
+h3-export/__pycache__/
+h3-export/lib/__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
+
+# Local tool config
+.claude/
